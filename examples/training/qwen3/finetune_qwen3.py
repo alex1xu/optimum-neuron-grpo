@@ -20,12 +20,9 @@ from datasets import load_dataset
 from peft import LoraConfig
 from transformers import AutoTokenizer, HfArgumentParser
 
-# from optimum.neuron import NeuronSFTConfig, NeuronSFTTrainer 
-from optimum.neuron import NeuronTrainingArguments
+from optimum.neuron import NeuronSFTConfig, NeuronSFTTrainer, NeuronTrainingArguments
 from optimum.neuron.models.training import NeuronModelForCausalLM
 
-from trl import SFTTrainer, SFTConfig
-from optimum.neuron import NeuronTrainingArguments
 
 # =============================================================================
 # Data Loading and Preprocessing Function
@@ -84,10 +81,9 @@ def train(model_id, tokenizer, dataset, training_args):
     )
 
     # Converting the NeuronTrainingArguments to a dictionary to feed them to the NeuronSFTConfig.
-    # UPD: changed to SFTConfig.
     args = training_args.to_dict()
 
-    sft_config = SFTConfig(
+    sft_config = NeuronSFTConfig(
         max_seq_length=4096,
         packing=True,
         **args,
@@ -98,8 +94,7 @@ def train(model_id, tokenizer, dataset, training_args):
 
     # The NeuronSFTTrainer will use `formatting_function` to format the dataset and `lora_config` to apply LoRA on the
     # model.
-    # UPD: SFTTrainer.
-    trainer = SFTTrainer(
+    trainer = NeuronSFTTrainer(
         args=sft_config,
         model=model,
         peft_config=lora_config,
