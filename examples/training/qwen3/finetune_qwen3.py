@@ -82,15 +82,12 @@ def train(model_id, tokenizer, dataset, training_args):
 
     # Converting the NeuronTrainingArguments to a dictionary to feed them to the NeuronSFTConfig.
     args = training_args.to_dict()
-    
+
     print('HERE')
     print(args)
 
-    args.pop("packing", None) # not defined in NeuronSFTConfig
-
     sft_config = NeuronSFTConfig(
-        packing=True,
-        **args,
+        **args
     )
 
     def formatting_function(examples):
