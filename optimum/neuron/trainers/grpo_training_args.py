@@ -48,7 +48,7 @@ log_levels = dict(**trainer_log_levels, silent=100)
 
 
 @dataclass
-class NeuronTrainingArguments:
+class GRPONeuronTrainingArguments:
     # Sometimes users will pass in a `str` repr of a dict in the CLI
     # We need to track what fields those can be. Each time a new arg
     # has a dict type, it must be added to this list.
