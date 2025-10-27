@@ -15,7 +15,7 @@ else:
     @dataclass
     class GRPOConfig:
         def __init__(self, *args, **kwargs):
-            raise RuntimeError(f"You need to install the `trl=={TRL_VERSION}` library to use the `NeuronSFTConfig`.")
+            raise RuntimeError(f"You need to install the `trl=={TRL_VERSION}` library to use the `NeuronGRPOConfig`.")
 
 
 @dataclass
