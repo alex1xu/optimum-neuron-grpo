@@ -19,7 +19,7 @@ else:
 
 
 @dataclass
-class NeuronSFTConfig(NeuronTrainingArguments, GRPOConfig):
+class NeuronGRPOConfig(NeuronTrainingArguments, GRPOConfig):
     def __post_init__(self):
         self.do_eval = False
         self.eval_strategy = "no"
