@@ -81,72 +81,188 @@ class NeuronGRPOTrainer(_GRPOTrainer):
         peft_config: Any | None = None,
         **kwargs,
     ):
-        # Ensure TRL is present and has an expected version when constructing the Neuron wrapper.
-        if not is_trl_available(required_version=TRL_VERSION):
-            raise RuntimeError(f"Using NeuronGRPOTrainer requires trl=={TRL_VERSION}.")
+        # Implement when GRPO config is setup
+        # Copy paste sft_trainer.py __init__
 
-        # If no args are provided, create a default GRPOConfig so downstream code can rely on attributes.
-        args_is_none = args is None
-        if args is None:
-            args = GRPOConfig()
-
-        # Align deprecated tokenizer arg to processing_class to keep parity with NeuronTrainer.
-        if tokenizer is not None and processing_class is None:
-            processing_class = tokenizer
-
-        # Set logging verbosity according to the args (if they expose that API).
-        try:
-            log_level = args.get_process_log_level()
-            logging.set_verbosity(log_level)
-        except Exception:
-            # If the GRPOConfig doesn't expose this, ignore.
-            pass
-
-        # Call NeuronTrainer.__init__ to setup Neuron training infra. We intentionally keep
-        # the call surface minimal and rely on the TRL mix-in to add GRPO-specific methods.
-        NeuronTrainer.__init__(
-            self,
-            model,
-            args,
-            data_collator=data_collator,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            processing_class=processing_class,
-            callbacks=callbacks,
-            optimizers=optimizers,
-            optimizer_cls_and_kwargs=optimizer_cls_and_kwargs,
-            tokenizer=tokenizer,
-        )
-
-        # If the wrapped TRL trainer provides any tagging or metadata hooks, call them.
-        if hasattr(self.model, "add_model_tags"):
-            try:
-                self.model.add_model_tags(getattr(self, "_tag_names", None))
-            except Exception:
-                # Non-fatal: tagging is optional
-                logger.debug("add_model_tags hook failed or not provided by the model.")
+        model_forward = model.forward if not isinstance(model, NeuronPeftModel) else model.get_base_model().forward
+        forward_params = inspect.signature(model_forward).parameters
+        
+        pass
 
     def train(self, resume_from_checkpoint: str | bool | None = None):
         """
-        Run training using the Neuron training loop.
-
-        We delegate to `NeuronTrainer.train` which implements the XLA/Neuron training
-        loop and co-ordinates callbacks, checkpointing, and the optimizer steps.
+        - beta is hyperparam for KL divergence to measure how much diverge
+        
+        TODOs
+        overwrite train_step and add variables for ref/new/old_logits
+        figure out where `advantages` come from
         """
+        
+        if resume_from_checkpoint not in [False, None]:
+            raise ValueError("`resume_from_checkpoint` is not supported by the NeuronTrainer.")
 
-        return NeuronTrainer.train(
-            self,
-            resume_from_checkpoint=resume_from_checkpoint
-        )
+        args = self.args
 
-    # Optionally, keep a small helper which mirrors SFTTrainer's non-packed dataloader preparation
-    # if GRPO training needs dataset tokenization helpers in the future.
-    def _prepare_non_packed_dataloader(self, *args, **kwargs):
-        """Default passthrough to support scripts that call this method.
+        self.accelerator.free_memory()
 
-        The real GRPOTrainer from TRL may implement specialized data preparation; here we
-        simply raise NotImplementedError to indicate scripts should fallback to other logic
-        or the TRL-provided methods.
-        """
+        # Data loader and number of training steps
+        train_dataloader = self.get_train_dataloader()
 
-        raise NotImplementedError("_prepare_non_packed_dataloader is trainer-specific and not implemented in the Neuron wrapper.")
+        total_train_batch_size = self.args.train_batch_size * args.gradient_accumulation_steps
+        (
+            num_train_epochs,
+            _,
+            num_examples,
+            _,
+            _,
+            len_dataloader,
+            max_steps,
+        ) = self.set_initial_training_values(args, train_dataloader, total_train_batch_size)
+
+        self.setup_training(train_dataloader, max_steps, num_train_epochs, num_examples, total_train_batch_size)
+
+        is_distributed = isinstance(train_dataloader.sampler, torch.utils.data.distributed.DistributedSampler)
+        for epoch in range(num_train_epochs):
+            # We need to call set_epoch for distributed samplers to shuffle the ordering between epochs.
+            # See: https://docs.pytorch.org/docs/stable/data.html#torch.utils.data.distributed.DistributedSampler
+            if is_distributed:
+                train_dataloader.sampler.set_epoch(epoch)
+
+            steps_in_epoch = (
+                len_dataloader if len_dataloader is not None else args.max_steps * args.gradient_accumulation_steps
+            )
+
+            self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
+
+            step = -1
+            epoch_iterator = iter(train_dataloader)
+
+            remainder = steps_in_epoch % args.gradient_accumulation_steps
+            if remainder == 0:
+                remainder = args.gradient_accumulation_steps
+            update_step = -1
+
+            total_updates = steps_in_epoch // args.gradient_accumulation_steps + int(
+                remainder < args.gradient_accumulation_steps
+            )
+
+            for _ in range(total_updates):
+                num_batches = args.gradient_accumulation_steps if update_step != (total_updates - 1) else remainder
+                batch_samples, num_items_in_batch = self.get_batch_samples(
+                    epoch_iterator,
+                    num_batches,
+                    device=xm.xla_device(),
+                    prefetch_size=args.dataloader_prefetch_size,
+                )
+
+                for inputs in batch_samples:
+                    xm.mark_step()
+                    step += 1
+                    do_sync_step = (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == steps_in_epoch
+
+                    if step % args.gradient_accumulation_steps == 0:
+                        self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
+
+                    loss_step = self.train_step(self.model, inputs, num_items_in_batch=num_items_in_batch)
+                    self.running_loss += loss_step.detach()
+
+                    if do_sync_step:
+                        self.accelerator.gradient_state.sync_gradients = True
+                        xm.mark_step()
+                        # Gradient clipping
+
+                        self.control = self.callback_handler.on_pre_optimizer_step(args, self.state, self.control)
+
+                        self.optimizer.step()
+                        self.grad_norm = self.optimizer.grad_norm
+
+                        self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
+
+                        # Delay optimizer scheduling until metrics are generated
+                        if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                            self.lr_scheduler.step()
+
+                        self.optimizer.zero_grad()
+
+                        self.state.global_step += 1
+                        self.state.epoch = epoch + (step + 1) / steps_in_epoch
+                        self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+                        xm.mark_step()
+                    else:
+                        self.accelerator.gradient_state.sync_gradients = False
+                        self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
+
+                    self.maybe_log_train_step_metrics()
+                    self.maybe_save_checkpoint()
+
+                    if self.control.should_epoch_stop or self.control.should_training_stop:
+                        # PyTorch/XLA relies on the data loader to insert the mark_step for
+                        # each step. Since we are breaking the loop early, we need to manually
+                        # insert the mark_step here.
+                        xm.mark_step()
+                        break
+
+                # We also need to break out of the nested loop
+                if self.control.should_epoch_stop or self.control.should_training_stop:
+                    xm.mark_step()
+                    break
+
+            if step < 0:
+                logger.warning(
+                    "There seems to be not a single sample in your epoch_iterator, stopping training at step"
+                    f" {self.state.global_step}! This is expected if you're using an IterableDataset and set"
+                    f" num_steps ({max_steps}) higher than the number of available samples."
+                )
+                self.control.should_training_stop = True
+
+            self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
+            xm.mark_step()
+
+            if self.control.should_training_stop:
+                break
+
+        logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
+        self.control = self.callback_handler.on_train_end(args, self.state, self.control)
+
+    
+    def compute_loss(self, model, inputs, return_outputs=False):
+        labels = inputs.get("labels")
+
+        # forward pass
+        outputs = model(**inputs)
+        logits = outputs.get("logits")
+
+        # compute custom grpo loss
+        loss, completion_length, mean_kl = grpo_compute_loss(
+                ref_logits,
+                new_logits,
+                old_logits,
+                input_ids,
+                mask,
+                beta,
+                advantages,
+                **extra_kwargs,
+            )
+
+        return (loss, outputs) if return_outputs else loss
+    
+    def accumulate_chunk(
+            new_hidden_states_j,
+            old_hidden_states_j,
+            ref_hidden_states_j,
+            input_ids_j,
+            mask_j,
+            advantages_j,
+            scaling,
+            grad_inputs_j,
+        ):
+            (chunk_grad_input,), (chunk_loss, (unscaled_loss, chunk_completion_length, chunk_mean_kl,)) = torch.func.grad_and_value(
+                compute_loss,
+                argnums = (0,),
+                has_aux = True,
+            )(new_hidden_states_j, old_hidden_states_j, ref_hidden_states_j, input_ids_j, mask_j, advantages_j, scaling)
+            accumulated_loss             .add_(unscaled_loss)
+            accumulated_completion_length.add_(chunk_completion_length)
+            accumulated_mean_kl          .add_(chunk_mean_kl)
+            grad_inputs_j[:] = chunk_grad_input
+        pass
