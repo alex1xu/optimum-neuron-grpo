@@ -1,4 +1,3 @@
-# coding=utf-8
 """
 GRPO trainer adapted for Neuron.
 
