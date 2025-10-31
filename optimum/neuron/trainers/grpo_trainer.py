@@ -117,11 +117,11 @@ class NeuronGRPOTrainer(_GRPOTrainer):
             except Exception:
                 self.args.generation_batch_size = int(self.num_generations)
 
-        # TRL's dataloader/sampler references `self.num_iterations`; default to 1
+        # TRL dataloader/sampler references self.num_iterations
         if not hasattr(self, "num_iterations"):
             self.num_iterations = 1
 
-        # TRL's dataloader checks `self.shuffle_dataset`; default to True
+        # TRL dataloader checks self.shuffle_dataset
         if not hasattr(self, "shuffle_dataset"):
             try:
                 self.shuffle_dataset = bool(getattr(self.args, "shuffle_dataset", True))
