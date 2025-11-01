@@ -12,6 +12,7 @@ from transformers import (
     GenerationConfig,
 )
 from neuronx_distributed.pipeline import NxDPPModel
+from neuronx_distributed.parallel_layers.parallel_state import get_data_parallel_replica_groups
 
 from ..utils import is_trl_available
 from .grpo_config import NeuronGRPOConfig
@@ -373,9 +374,70 @@ class NeuronGRPOTrainer(NeuronTrainer):
     # Use GRPO methods that don't need modification
     _generate = _GRPO._generate
     _generate_and_score_completions = _GRPO._generate_and_score_completions
-    _calculate_rewards = _GRPO._calculate_rewards
     _compute_loss = _GRPO._compute_loss
     
+    def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list):
+        # Override reward calculation to compute and gather rewards for Neuron/XLA
+        # Computes rewards on CPU -> move to XLA before gathering -> return tensor on XLA
+
+        # Compute rewards on CPU to avoid triggering XLA compilation
+        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device="cpu", dtype=torch.float32)
+        
+        # Repeat all input columns (but "prompt", "completion", and "completion_ids") to match the num of generations
+        keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
+        reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+        
+        # This allows for dynamic reward shaping based on training progress.
+        reward_kwargs["trainer_state"] = self.state
+        
+        for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
+            zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names)
+        ):
+            if isinstance(reward_func, torch.nn.Module):
+                # Module-based reward functions: TODO - support on accelerator device in future
+                raise NotImplementedError(
+                    "nn.Module reward functions not yet supported on Neuron. "
+                    "Use functional reward functions that compute on CPU."
+                )
+            else:
+                # Functional reward functions: compute on CPU
+                output_reward_func = reward_func(
+                    prompts=prompts, completions=completions, completion_ids=completion_ids_list, **reward_kwargs
+                )
+                # Convert None values to NaN
+                output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
+                
+                rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device="cpu")
+        
+        # Validate rewards
+        if torch.isnan(rewards_per_func).all(dim=1).any():
+            nan_row_idx = torch.isnan(rewards_per_func).all(dim=1).nonzero(as_tuple=True)[0][0]
+            row_reward_kwargs = {
+                key: value[nan_row_idx] for key, value in reward_kwargs.items() if key != "trainer_state"
+            }
+            row_reward_kwargs["prompt"] = prompts[nan_row_idx]
+            row_reward_kwargs["completion"] = completions[nan_row_idx]
+            logger.warning(
+                f"All reward functions returned None for the following kwargs:\n{row_reward_kwargs}\n"
+                "Please ensure that at least one reward function returns a valid reward."
+            )
+        
+        # Move to XLA device before any collective operations
+        xla_device = self.accelerator.device
+        rewards_per_func = rewards_per_func.to(xla_device)
+        
+        # Gather across all data parallel processes using XLA's all_gather
+        if self.dp_size > 1:
+            # xm.all_gather signature: all_gather(value, dim=0, groups=None)
+            # It concatenates tensors along the specified dimension from all processes
+            rewards_per_func = xm.all_gather(
+                rewards_per_func,
+                dim=0,  # Concatenate along batch dimension
+                groups=get_data_parallel_replica_groups(),
+            )
+        
+        return rewards_per_func
+
     def _get_per_token_logps_and_entropies(
         self,
         model,
