@@ -1,4 +1,6 @@
 from typing import Any
+import inspect
+import os
 import torch
 import torch_xla.core.xla_model as xm
 from optimum.utils import logging
@@ -6,10 +8,10 @@ from transformers import (
     PreTrainedModel,
     PreTrainedTokenizerBase,
     AutoModelForCausalLM,
+    AutoTokenizer,
     GenerationConfig,
 )
 from neuronx_distributed.pipeline import NxDPPModel
-from contextlib import nullcontext
 
 from ..utils import is_trl_available
 from .grpo_config import NeuronGRPOConfig
@@ -24,32 +26,52 @@ if is_trl_available():
     from trl import GRPOConfig, GRPOTrainer
     from trl.data_utils import is_conversational
     from trl.trainer.utils import (
-        pad,
         split_tensor_dict,
         shuffle_sequence_dict,
+        selective_log_softmax,
+        entropy_from_logits,
     )
+    _GRPO = GRPOTrainer
 else:
     class GRPOTrainer:
         pass
     class GRPOConfig:
         pass
+    _GRPO = None
 
 
 def identity(x):
-    """Identity collator for GRPO."""
+    # Identity collator for GRPO
     return x
+
+
+def pad_to_neuron_sequence_length(tensor: torch.Tensor, pad_value: int) -> torch.Tensor:
+    # Pad tensor to be a multiple of 2048 for Neuron flash attention
+    NEURON_SEQ_LENGTH_MULTIPLE = 2048
+    seq_len = tensor.size(1)
+    
+    if seq_len % NEURON_SEQ_LENGTH_MULTIPLE == 0:
+        return tensor
+    
+    pad_length = NEURON_SEQ_LENGTH_MULTIPLE - (seq_len % NEURON_SEQ_LENGTH_MULTIPLE)
+    # Pad along sequence dimension (dim 1)
+    if tensor.dim() == 2:  # (batch, seq_len)
+        padded = torch.nn.functional.pad(tensor, (0, pad_length), value=pad_value)
+    elif tensor.dim() == 3:  # (batch, seq_len, features)
+        padded = torch.nn.functional.pad(tensor, (0, 0, 0, pad_length), value=pad_value)
+    else:
+        raise ValueError(f"Unsupported tensor dimension: {tensor.dim()}")
+    
+    return padded
 
 
 class NeuronGRPOTrainer(NeuronTrainer):
     """
     GRPO Trainer for Neuron/Trainium devices.
     
-    This implementation uses a hybrid approach:
-    - Generation happens on CPU/CUDA using a lightweight model
-    - Training happens on Neuron/Trainium for optimal performance
-    
-    This is necessary because Neuron models wrapped for distributed training
-    don't support efficient generation APIs.
+    Critical constraints for Neuron:
+    1. Generator model must load before distributed training fork
+    2. All tensors must have fixed shapes
     """
 
     def __init__(
@@ -70,6 +92,20 @@ class NeuronGRPOTrainer(NeuronTrainer):
         if not is_trl_available(required_version=TRL_VERSION):
             raise RuntimeError(f"Using NeuronGRPOTrainer requires trl=={TRL_VERSION}.")
 
+        # set up critical section before parent init to avoid fork issues
+
+        if isinstance(model, str):
+            self.model_name_or_path = model
+        else:
+            self.model_name_or_path = getattr(getattr(model, "config", None), "_name_or_path", None)
+        
+        if not self.model_name_or_path:
+            raise ValueError(
+                "NeuronGRPOTrainer requires a model ID string. "
+                "Pass the model as: model='Qwen/Qwen2-0.5B-Instruct'"
+            )
+
+        # Setup args
         args_is_none = args is None
         if args is None:
             args = NeuronGRPOConfig(output_dir="tmp_trainer")
@@ -78,6 +114,62 @@ class NeuronGRPOTrainer(NeuronTrainer):
             args_as_dict.update({k: getattr(args, k) for k in args_as_dict.keys() if k.endswith("_token")})
             args = NeuronGRPOConfig(**args_as_dict)
 
+        # Set GRPO params early (needed for generator init)
+        self.max_prompt_length = getattr(args, "max_prompt_length", 512)
+        self.max_completion_length = getattr(args, "max_completion_length", 128)
+        self.num_generations = getattr(args, "num_generations", 1)
+        self.temperature = getattr(args, "temperature", 1.0)
+        self.top_p = getattr(args, "top_p", 1.0)
+        self.top_k = getattr(args, "top_k", None)
+        
+        # Some models don't support `logits_to_keep` argument - check before wrapping
+        if isinstance(model, PreTrainedModel):
+            self.model_kwarg_keys = inspect.signature(model.forward).parameters.keys()
+        else:
+            self.model_kwarg_keys = set()  # Will be set after model is prepared
+        
+        # init generator before parent init
+        logger.info("[PRE-INIT] Loading generator model before distributed setup...")
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        
+        self._generator_tokenizer = processing_class or tokenizer or AutoTokenizer.from_pretrained(
+            self.model_name_or_path
+        )
+        
+        self.generator_model = AutoModelForCausalLM.from_pretrained(
+            self.model_name_or_path,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+        )
+        
+        generator_device = getattr(args, "generator_device", "cpu")
+        if generator_device == "cuda" and torch.cuda.is_available():
+            self.generator_model = self.generator_model.to("cuda")
+            logger.info("[PRE-INIT] Generator on CUDA")
+        else:
+            self.generator_model = self.generator_model.to("cpu")
+            logger.info("[PRE-INIT] Generator on CPU")
+        
+        self.generator_model.eval()
+        
+        # Setup generation config
+        generation_kwargs = {
+            "max_new_tokens": self.max_completion_length,
+            "do_sample": True,
+            "pad_token_id": self._generator_tokenizer.pad_token_id,
+            "eos_token_id": self._generator_tokenizer.eos_token_id,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+        }
+        if self.top_k is not None:
+            generation_kwargs["top_k"] = self.top_k
+        self.generation_config = GenerationConfig(**generation_kwargs)
+        
+        logger.info("[PRE-INIT] Generator model ready")
+        
+        # critical section: parent init (will fork for distributed training)
+        # CRITICAL SECTION 2: Parent init ()
+        
         if args_is_none:
             log_level = args.get_process_log_level()
             logging.set_verbosity(log_level)
@@ -85,12 +177,6 @@ class NeuronGRPOTrainer(NeuronTrainer):
 
         if data_collator is None:
             data_collator = identity
-
-        # Store model_id before parent init
-        if isinstance(model, str):
-            self.model_name_or_path = model
-        else:
-            self.model_name_or_path = getattr(model.config, "_name_or_path", None)
 
         super().__init__(
             model=model,
@@ -103,16 +189,24 @@ class NeuronGRPOTrainer(NeuronTrainer):
             optimizers=optimizers,
             optimizer_cls_and_kwargs=optimizer_cls_and_kwargs,
         )
+        
+        # post-init setup
+        
+        # Set model_kwarg_keys after model is prepared
+        if hasattr(self, 'model') and self.model is not None:
+            # For distributed models, check the base model
+            model_to_check = self.model
+            if isinstance(model_to_check, NxDPPModel):
+                # For NxDPPModel, we need to get the actual wrapped model
+                model_to_check = model_to_check.module if hasattr(model_to_check, 'module') else model_to_check
+            elif hasattr(model_to_check, 'get_base_model'):
+                model_to_check = model_to_check.get_base_model()
+            
+            self.model_kwarg_keys = inspect.signature(model_to_check.forward).parameters.keys()
 
         # GRPO-specific attributes
-        self.max_prompt_length = getattr(self.args, "max_prompt_length", None)
-        self.max_completion_length = getattr(self.args, "max_completion_length", None)
-        self.num_generations = getattr(self.args, "num_generations", 1)
-        self.temperature = getattr(self.args, "temperature", 1.0)
-        self.top_p = getattr(self.args, "top_p", 1.0)
-        self.top_k = getattr(self.args, "top_k", None)
-        self.min_p = getattr(self.args, "min_p", None)
         self.repetition_penalty = getattr(self.args, "repetition_penalty", None)
+        self.min_p = getattr(self.args, "min_p", None)
         self.chat_template_kwargs = getattr(self.args, "chat_template_kwargs", {}) or {}
         
         self.loss_type = getattr(self.args, "loss_type", "grpo")
@@ -122,24 +216,24 @@ class NeuronGRPOTrainer(NeuronTrainer):
         self.beta = getattr(self.args, "beta", 0.0)
         self.epsilon_low = getattr(self.args, "epsilon", 0.1)
         self.epsilon_high = getattr(self.args, "epsilon_high", self.epsilon_low)
+        self.use_vllm = getattr(self.args, "use_vllm", False)
+        self.use_liger_loss = getattr(self.args, "use_liger_loss", False)
+        self.top_entropy_quantile = getattr(self.args, "top_entropy_quantile", 1.0)
         
         self._step = 0
         self._buffered_inputs = None
-        self._generation_step_counter = 0  # Track when to regenerate
+        self._generation_step_counter = 0
+        self._buffer_index = 0
         
         self.num_iterations = getattr(self.args, "num_iterations", 1)
         self.shuffle_dataset = getattr(self.args, "shuffle_dataset", True)
         
         # Calculate how many steps we generate for at once
         if not hasattr(self.args, "steps_per_generation"):
-            # Default: generate once per gradient accumulation cycle
             self.args.steps_per_generation = self.args.gradient_accumulation_steps
         
         if not hasattr(self.args, "generation_batch_size") or self.args.generation_batch_size is None:
             self.args.generation_batch_size = self.args.per_device_train_batch_size * self.args.steps_per_generation
-
-        # Initialize CPU model for generation
-        self._init_generator_model()
 
         # Reward functions
         if reward_funcs is not None:
@@ -177,55 +271,15 @@ class NeuronGRPOTrainer(NeuronTrainer):
         self.pad_token_id = self.processing_class.pad_token_id
         self.eos_token_id = self.processing_class.eos_token_id
 
-    def _init_generator_model(self):
-        """Initialize a separate model for generation on CPU/CUDA."""
-        if not self.model_name_or_path:
-            raise ValueError(
-                "Cannot initialize generator model without model name or path. "
-                "Please pass a model ID string to the trainer."
-            )
-        
-        logger.info(f"Initializing generator model on CPU from {self.model_name_or_path}")
-        
-        # Load a lightweight version for generation
-        self.generator_model = AutoModelForCausalLM.from_pretrained(
-            self.model_name_or_path,
-            torch_dtype=torch.float16,  # Use fp16 for efficiency
-            low_cpu_mem_usage=True,
-        )
-        
-        # Move to CPU (or CUDA if available and args specify)
-        generator_device = getattr(self.args, "generator_device", "cpu")
-        if generator_device == "cuda" and torch.cuda.is_available():
-            self.generator_model = self.generator_model.to("cuda")
-            logger.info("Generator model loaded on CUDA")
-        else:
-            self.generator_model = self.generator_model.to("cpu")
-            logger.info("Generator model loaded on CPU")
-        
-        self.generator_model.eval()
-        
-        # Setup generation config
-        generation_kwargs = {
-            "max_new_tokens": self.max_completion_length,
-            "do_sample": True,
-            "pad_token_id": self.processing_class.pad_token_id,
-            "temperature": self.temperature,
-            "top_p": self.top_p,
-        }
-        if self.top_k is not None:
-            generation_kwargs["top_k"] = self.top_k
-        self.generation_config = GenerationConfig(**generation_kwargs)
-
     def _generate_single_turn(self, prompts: list, images=None):
-        """Generate completions using CPU/CUDA model."""
-        # Use the generator model on CPU/CUDA
+        # generate completions with fixed tensor shapes
+        # must return list of same length token lists (across all batches) for neuron compilation
         generator_device = next(self.generator_model.parameters()).device
         
-        # Build generation inputs
+        # generation inputs
         processor_kwargs = {
             "return_tensors": "pt",
-            "padding": True,
+            "padding": "max_length",  # pad to fixed length
             "padding_side": "left",
             "max_length": self.max_prompt_length,
             "truncation": True,
@@ -233,7 +287,7 @@ class NeuronGRPOTrainer(NeuronTrainer):
         }
         
         if is_conversational({"prompt": prompts[0]}):
-            generate_inputs = self.processing_class.apply_chat_template(
+            generate_inputs = self._generator_tokenizer.apply_chat_template(
                 conversation=prompts,
                 **processor_kwargs,
                 add_generation_prompt=True,
@@ -242,7 +296,7 @@ class NeuronGRPOTrainer(NeuronTrainer):
                 **self.chat_template_kwargs,
             )
         else:
-            generate_inputs = self.processing_class(text=prompts, **processor_kwargs)
+            generate_inputs = self._generator_tokenizer(text=prompts, **processor_kwargs)
         
         # Move to generator device
         generate_inputs = {
@@ -250,43 +304,118 @@ class NeuronGRPOTrainer(NeuronTrainer):
             for k, v in generate_inputs.items()
         }
         
-        # Generate on CPU/CUDA
+        # Generate with fixed output length
         with torch.no_grad():
             prompt_completion_ids = self.generator_model.generate(
                 **generate_inputs,
-                generation_config=self.generation_config,
+                max_length=self.max_prompt_length + self.max_completion_length,
+                pad_token_id=self.pad_token_id,
+                eos_token_id=self.eos_token_id,
+                do_sample=self.generation_config.do_sample,
+                temperature=self.generation_config.temperature,
+                top_p=self.generation_config.top_p,
+                top_k=self.generation_config.top_k,
             )
         
-        # Move results back to CPU for further processing
+        # Move to CPU
         prompt_completion_ids = prompt_completion_ids.cpu()
         prompt_ids = generate_inputs["input_ids"].cpu()
         prompt_mask = generate_inputs["attention_mask"].cpu()
         
-        # Extract completions
-        prompt_length = prompt_ids.size(1)
-        completion_ids = prompt_completion_ids[:, prompt_length:]
+        # Extract fixed-length completions
+        # Prompt is already max_prompt_length (padded above)
+        completion_ids = prompt_completion_ids[:, self.max_prompt_length:]
 
-        # Mask everything after the first EOS token
+        # # debug
+        # prompt_lengths = [len(p) for p in prompt_ids]
+        # completion_lengths = [len(c) for c in completion_ids]
+        # assert len(set(prompt_lengths)) == 2, f"Variable prompt lengths: {prompt_lengths}"
+        # assert len(set(completion_lengths)) == 1, f"Variable completion lengths: {completion_lengths}"
+        # assert prompt_lengths[0] == self.max_prompt_length, f"Wrong prompt length: {prompt_lengths[0]}"
+        # assert completion_lengths[0] == self.max_completion_length, f"Wrong completion length: {completion_lengths[0]}"
+        
+        # Ensure exactly max_completion_length
+        if completion_ids.size(1) < self.max_completion_length:
+            pad_length = self.max_completion_length - completion_ids.size(1)
+            completion_ids = torch.nn.functional.pad(
+                completion_ids, (0, pad_length), value=self.pad_token_id
+            )
+        else:
+            completion_ids = completion_ids[:, :self.max_completion_length]
+        
+        # Create completion masks (1 until EOS, 0 after)
         is_eos = completion_ids == self.eos_token_id
-        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long)
+        eos_idx = torch.full((is_eos.size(0),), self.max_completion_length, dtype=torch.long)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
-        sequence_indices = torch.arange(is_eos.size(1)).expand(is_eos.size(0), -1)
+        
+        sequence_indices = torch.arange(self.max_completion_length).expand(is_eos.size(0), -1)
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
         
-        # Convert to lists
-        prompt_ids = [p[m].tolist() for p, m in zip(prompt_ids, prompt_mask.bool())]
-        completion_ids = [c[m].tolist() for c, m in zip(completion_ids, completion_mask.bool())]
+        # This ensures TRL's pad() function becomes a no-op
+        prompt_ids_list = []
+        completion_ids_list = []
         
-        return prompt_ids, completion_ids, None, {}
+        for p, pm, c, cm in zip(prompt_ids, prompt_mask, completion_ids, completion_mask):
+            # Extract only non-padding tokens from prompts
+            valid_prompt = p[pm.bool()].tolist()
+            # Pad prompt back to max_prompt_length for consistency
+            valid_prompt += [self.pad_token_id] * (self.max_prompt_length - len(valid_prompt))
+            prompt_ids_list.append(valid_prompt)
+            
+            # Extract only valid tokens from completions  
+            valid_completion = c[cm.bool()].tolist()
+            # Pad completion back to max_completion_length for consistency
+            valid_completion += [self.pad_token_id] * (self.max_completion_length - len(valid_completion))
+            completion_ids_list.append(valid_completion)
+        
+        return prompt_ids_list, completion_ids_list, None, {}
 
-    # Import GRPO methods that don't need modification
-    from trl.trainer.grpo_trainer import GRPOTrainer as _GRPO
-    
+    # Use GRPO methods that don't need modification
     _generate = _GRPO._generate
     _generate_and_score_completions = _GRPO._generate_and_score_completions
     _calculate_rewards = _GRPO._calculate_rewards
     _compute_loss = _GRPO._compute_loss
-    _get_per_token_logps_and_entropies = _GRPO._get_per_token_logps_and_entropies
+    
+    def _get_per_token_logps_and_entropies(
+        self,
+        model,
+        input_ids,
+        attention_mask,
+        logits_to_keep,
+        batch_size=None,
+        compute_entropy=False,
+        pixel_values=None,
+        image_grid_thw=None,
+        num_images=None,
+        pixel_attention_mask=None,
+        image_sizes=None,
+        token_type_ids=None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # Override to pad inputs to Neuron's flash attention 2048 multiple requirement
+        original_seq_len = input_ids.size(1)
+        logger.info(f"[_get_per_token_logps] Original input_ids shape: {input_ids.shape}")
+        input_ids_padded = pad_to_neuron_sequence_length(input_ids, self.pad_token_id)
+        attention_mask_padded = pad_to_neuron_sequence_length(attention_mask, 0)
+        logger.info(f"[_get_per_token_logps] Padded input_ids shape: {input_ids_padded.shape}")
+        
+        # Call parent method with padded inputs
+        logps, entropies = _GRPO._get_per_token_logps_and_entropies(
+            self,
+            model,
+            input_ids_padded,
+            attention_mask_padded,
+            logits_to_keep,
+            batch_size=batch_size,
+            compute_entropy=compute_entropy,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            num_images=num_images,
+            pixel_attention_mask=pixel_attention_mask,
+            image_sizes=image_sizes,
+            token_type_ids=token_type_ids,
+        )
+        
+        return logps, entropies
 
     def _set_signature_columns_if_needed(self):
         """Override to set GRPO-specific signature columns."""
@@ -300,24 +429,13 @@ class NeuronGRPOTrainer(NeuronTrainer):
         device: torch.device | None = None,
         prefetch_size: int | None = None,
     ) -> tuple[list[dict[str, Any]], int | torch.Tensor | None]:
-        """
-        Override to handle GRPO's generation and buffering logic.
-        
-        The key insight: we need to generate completions for multiple steps at once,
-        then buffer and return one step's worth at a time.
-        
-        Flow:
-        1. Every `steps_per_generation` steps, collect prompts and generate
-        2. Split generated batch across steps
-        3. Return current step's slice
-        """
+        # override to hadnel GRPO generation and buffering logic
         # Check if we need to generate new completions
         generate_every = self.args.steps_per_generation * self.num_iterations
         if self._generation_step_counter % generate_every == 0 or self._buffered_inputs is None:
             logger.info(f"Generating completions at generation step {self._generation_step_counter}")
             
             # Collect prompts for the full generation batch
-            # We need steps_per_generation * num_batches worth of data
             total_batches_needed = self.args.steps_per_generation
             raw_batches = []
             
@@ -339,8 +457,16 @@ class NeuronGRPOTrainer(NeuronTrainer):
                 else:
                     raw_samples.append(batch)
             
-            # Generate completions for all samples
+            # Generate completions (returns fixed-shape tensors)
             generation_batch = self._generate_and_score_completions(raw_samples)
+            
+            # Verify shapes are fixed
+            if "prompt_ids" in generation_batch:
+                assert generation_batch["prompt_ids"].size(1) == self.max_prompt_length, \
+                    f"Prompt shape: {generation_batch['prompt_ids'].size(1)} != {self.max_prompt_length}"
+            if "completion_ids" in generation_batch:
+                assert generation_batch["completion_ids"].size(1) == self.max_completion_length, \
+                    f"Completion shape: {generation_batch['completion_ids'].size(1)} != {self.max_completion_length}"
             
             # Shuffle and split for multiple optimizer steps
             generation_batch = shuffle_sequence_dict(generation_batch)
@@ -359,6 +485,12 @@ class NeuronGRPOTrainer(NeuronTrainer):
         if self._buffer_index >= len(self._buffered_inputs):
             self._buffer_index = 0
         
+        logger.info(f"[get_batch_samples] batch keys: {list(current_batch.keys())}")
+        if "prompt_ids" in current_batch:
+            logger.info(f"[get_batch_samples] prompt_ids shape: {current_batch['prompt_ids'].shape}")
+        if "completion_ids" in current_batch:
+            logger.info(f"[get_batch_samples] completion_ids shape: {current_batch['completion_ids'].shape}")
+        
         # Move to XLA device
         if device is not None and device.type == "xla":
             current_batch = {
@@ -366,8 +498,6 @@ class NeuronGRPOTrainer(NeuronTrainer):
                 for k, v in current_batch.items()
             }
         
-        # Return as a single-item list (for compatibility with NeuronTrainer)
-        # The dict is already the prepared inputs for one step
         return [current_batch], None
 
     def compute_loss(
@@ -377,12 +507,7 @@ class NeuronGRPOTrainer(NeuronTrainer):
         return_outputs: bool = False,
         num_items_in_batch: int | torch.Tensor | None = None,
     ):
-        """
-        Compute GRPO loss.
-        
-        This method delegates to GRPO's _compute_loss which handles the
-        special prompt/completion split and advantage-based loss.
-        """
+        """Compute GRPO loss."""
         if return_outputs:
             raise ValueError("return_outputs=True is not supported for GRPO")
         
@@ -395,27 +520,70 @@ class NeuronGRPOTrainer(NeuronTrainer):
         inputs: dict[str, Any],
         num_items_in_batch: int | torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Training step that works with GRPO's prepared inputs.
-        
-        The inputs dict contains: prompt_ids, completion_ids, masks, advantages, etc.
-        """
+        """Training step that works with GRPO's prepared inputs."""
         manager = self.autocast_smart_context_manager()
 
+        logger.info(f"[train_step] model type: {type(model).__name__}")
+        logger.info(f"[train_step] inputs keys: {list(inputs.keys())}")
+        if "prompt_ids" in inputs:
+            logger.info(f"[train_step] prompt_ids shape: {inputs['prompt_ids'].shape}")
+        if "completion_ids" in inputs:
+            logger.info(f"[train_step] completion_ids shape: {inputs['completion_ids'].shape}")
+        if "input_ids" in inputs:
+            logger.info(f"[train_step] input_ids shape: {inputs['input_ids'].shape}")
+
         if isinstance(model, NxDPPModel):
-            # Pipeline parallel case
-            with manager:
-                loss = model.run_train(**inputs)
+            # Transform GRPO inputs to standard model inputs for pipeline parallelism
+            if "prompt_ids" in inputs and "completion_ids" in inputs:
+                # Concatenate prompt and completion for model
+                input_ids = torch.cat([inputs["prompt_ids"], inputs["completion_ids"]], dim=1)
+                attention_mask = torch.cat([inputs["prompt_mask"], inputs["completion_mask"]], dim=1)
+                seq_len = input_ids.size(1)
+                logger.info(f"[train_step NxDPPModel] Concatenated input_ids shape: {input_ids.shape}")
+                
+                # Pad to meet Neuron's flash attention requirement (multiples of 2048)
+                pad_token_id = self.pad_token_id
+                input_ids = pad_to_neuron_sequence_length(input_ids, pad_token_id)
+                attention_mask = pad_to_neuron_sequence_length(attention_mask, 0)
+                padded_seq_len = input_ids.size(1)
+                logger.info(f"[train_step NxDPPModel] Padded input_ids shape: {input_ids.shape}")
+                
+                # Create labels: -100 for prompts (ignore), actual tokens for completions
+                batch_size = input_ids.size(0)
+                labels = torch.full_like(input_ids, -100)
+                labels[:, :seq_len][:, self.max_prompt_length:] = inputs["completion_ids"]
+                logger.info(f"[train_step NxDPPModel] labels shape: {labels.shape}")
+                
+                # Build model inputs dict
+                model_inputs = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "labels": labels,
+                }
+                
+                # Add any other standard model inputs if present
+                for key in ["pixel_values", "image_grid_thw", "pixel_attention_mask", "image_sizes", "token_type_ids"]:
+                    if key in inputs:
+                        model_inputs[key] = inputs[key]
+                
+                logger.info(f"[train_step NxDPPModel] Calling run_train with keys: {list(model_inputs.keys())}")
+                
+                # Pass model inputs to run_train
+                with manager:
+                    loss = model.run_train(**model_inputs)
+            else:
+                # Already in standard format
+                with manager:
+                    loss = model.run_train(**inputs)
             
             if self.pp_rank != self.pp_size - 1:
                 dtype = torch.bfloat16 if self.args.bf16 else torch.float32
                 loss = torch.tensor(0, dtype=dtype).to(xm.xla_device())
         else:
-            # Standard case
+            # For non-pipeline models, _compute_loss handles concatenation and padding via _get_per_token_logps_and_entropies
             with manager:
                 loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)
             
-            # Backward pass
             self.accelerator.backward(loss)
         
         return loss
